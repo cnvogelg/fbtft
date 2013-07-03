@@ -31,35 +31,58 @@
 struct spi_device *spi_device = NULL;
 struct platform_device *p_device = NULL;
 
-static unsigned busnum = 0;
-static unsigned cs = 0;
-static unsigned speed = 0;
-static int mode = -1;
 static char *name = NULL;
-static char *gpios[MAX_GPIOS] = { NULL, };
-static int gpios_num = 0;
-static unsigned fps = 0;
-static int txbuflen = 0;
-static unsigned verbose = 3;
-
 module_param(name, charp, 0);
-MODULE_PARM_DESC(name, "Devicename (required). name=list lists supported devices.");
+MODULE_PARM_DESC(name, "Devicename (required). name=list => list all supported devices.");
+
+static unsigned rotate = 0;
+module_param(rotate, uint, 0);
+MODULE_PARM_DESC(rotate, "Rotate display 0=normal, 1=clockwise, 2=upside down, 3=counterclockwise (not supported by all drivers)");
+
+static unsigned busnum = 0;
 module_param(busnum, uint, 0);
 MODULE_PARM_DESC(busnum, "SPI bus number (default=0)");
+
+static unsigned cs = 0;
 module_param(cs, uint, 0);
 MODULE_PARM_DESC(cs, "SPI chip select (default=0)");
+
+static unsigned speed = 0;
 module_param(speed, uint, 0);
-MODULE_PARM_DESC(speed, "SPI speed (used to override default)");
+MODULE_PARM_DESC(speed, "SPI speed (override device default)");
+
+static int mode = -1;
 module_param(mode, int, 0);
-MODULE_PARM_DESC(mode, "SPI mode (used to override default)");
+MODULE_PARM_DESC(mode, "SPI mode (override device default)");
+
+static char *gpios[MAX_GPIOS] = { NULL, };
+static int gpios_num = 0;
 module_param_array(gpios, charp, &gpios_num, 0);
-MODULE_PARM_DESC(gpios, "List of gpios. Comma seperated with the form: reset:23,dc:24 (used to override default)");
+MODULE_PARM_DESC(gpios, "List of gpios. Comma separated with the form: reset:23,dc:24 (when overriding the default, all gpios must be specified)");
+
+static unsigned fps = 0;
 module_param(fps, uint, 0);
-MODULE_PARM_DESC(fps, "Frames per second (used to override default)");
+MODULE_PARM_DESC(fps, "Frames per second (override driver default)");
+
+static char *gamma = NULL;
+module_param(gamma, charp, 0);
+MODULE_PARM_DESC(gamma, "String representation of Gamma Curve(s). Driver specific.");
+
+static int txbuflen = 0;
 module_param(txbuflen, int, 0);
-MODULE_PARM_DESC(txbuflen, "txbuflen (used to override default)");
+MODULE_PARM_DESC(txbuflen, "txbuflen (override driver default)");
+
+static bool bgr = false;
+module_param(bgr, bool, 0);
+MODULE_PARM_DESC(bgr, "Use if Red and Blue color is swapped (supported by some drivers).");
+
+static unsigned startbyte = 0;
+module_param(startbyte, uint, 0);
+MODULE_PARM_DESC(startbyte, "Sets the Start byte used by some SPI displays.");
+
+static unsigned verbose = 3;
 module_param(verbose, uint, 0);
-MODULE_PARM_DESC(verbose, "0=silent, 0< show gpios, 1< show devices, 2< show devices before (default)");
+MODULE_PARM_DESC(verbose, "0=silent, 0< show gpios, 1< show devices, 2< show devices before (default=3)");
 
 
 /* supported SPI displays */
@@ -212,6 +235,28 @@ static struct spi_board_info fbtft_device_spi_displays[] = {
 				{},
 			},
 		}
+	}, {
+		.modalias = "hy28afb",
+		.max_speed_hz = 32000000,
+		.mode = SPI_MODE_3,
+		.platform_data = &(struct fbtft_platform_data) {
+			.gpios = (const struct fbtft_gpio []) {
+				{ "reset", 25 },
+				{ "led", 18 },
+				{},
+			},
+		}
+	}, {
+		.modalias = "ssd1351fb",
+		.max_speed_hz = 20000000,
+		.mode = SPI_MODE_0,
+		.platform_data = &(struct fbtft_platform_data) {
+			.gpios = (const struct fbtft_gpio []) {
+				{ "reset", 24 },
+				{ "dc", 25 },
+				{},
+			},
+		}
 	}
 };
 
@@ -262,6 +307,17 @@ static struct platform_device fbtft_device_pdev_displays[] = {
 							{ "db06", 8 },
 							{ "db07", 7 },
 							{ "led", 4 },
+							{},
+						},
+					},
+				},
+	}, {
+		.name = "sainsmart32fb",
+		.id = 0,
+		.dev = {
+					.release = fbtft_device_pdev_release,
+					.platform_data = &(struct fbtft_platform_data) {
+						.gpios = (const struct fbtft_gpio []) {
 							{},
 						},
 					},
@@ -334,7 +390,7 @@ static int __init fbtft_device_init(void)
 {
 	struct spi_master *master = NULL;
 	struct spi_board_info *display = NULL;
-	const struct fbtft_platform_data *pdata = NULL;
+	struct fbtft_platform_data *pdata = NULL;
 	const struct fbtft_gpio *gpio = NULL;
 	char *p_name, *p_num;
 	bool found = false;
@@ -386,6 +442,11 @@ static int __init fbtft_device_init(void)
 
 	pr_debug(DRVNAME":  name='%s', busnum=%d, cs=%d\n", name, busnum, cs);
 
+	if (rotate > 3) {
+		pr_warning("argument 'rotate' illegal value: %d (0-3). Setting it to 0.\n", rotate);
+		rotate = 0;
+	}
+
 	/* name=list lists all supported drivers */
 	if (strncmp(name, "list", 32) == 0) {
 		pr_info(DRVNAME":  Supported drivers:\n");
@@ -416,11 +477,15 @@ static int __init fbtft_device_init(void)
 				display->mode = mode;
 			if (pdata)
 				display->platform_data = pdata;
-			pdata = display->platform_data;
+			pdata = (void *)display->platform_data;
+			pdata->rotate = rotate;
+			pdata->bgr = bgr;
+			pdata->startbyte = startbyte;
+			pdata->gamma = gamma;
 			if (fps)
-				((struct fbtft_platform_data *)pdata)->fps = fps;
+				pdata->fps = fps;
 			if (txbuflen)
-				((struct fbtft_platform_data *)pdata)->txbuflen = txbuflen;
+				pdata->txbuflen = txbuflen;
 			spi_device = spi_new_device(master, display);
 			put_device(&master->dev);
 			if (!spi_device) {
@@ -437,18 +502,22 @@ static int __init fbtft_device_init(void)
 		for (i=0; i < ARRAY_SIZE(fbtft_device_pdev_displays); i++) {
 			if (strncmp(name, fbtft_device_pdev_displays[i].name, 32) == 0) {
 				p_device = &fbtft_device_pdev_displays[i];
+				if (pdata)
+					p_device->dev.platform_data = (void *)pdata;
+				pdata = p_device->dev.platform_data;
+				pdata->rotate = rotate;
+				pdata->bgr = bgr;
+				pdata->startbyte = startbyte;
+				pdata->gamma = gamma;
+				if (fps)
+					pdata->fps = fps;
+				if (txbuflen)
+					pdata->txbuflen = txbuflen;
 				ret = platform_device_register(p_device);
 				if (ret < 0) {
 					pr_err(DRVNAME":    platform_device_register() returned %d\n", ret);
 					return ret;
 				}
-				if (pdata)
-					p_device->dev.platform_data = (void *)pdata;
-				pdata = p_device->dev.platform_data;
-				if (fps)
-					((struct fbtft_platform_data *)pdata)->fps = fps;
-				if (txbuflen)
-					((struct fbtft_platform_data *)pdata)->txbuflen = txbuflen;
 				found = true;
 				break;
 			}

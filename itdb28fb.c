@@ -34,15 +34,12 @@
 #define HEIGHT      320
 #define BPP         16
 #define FPS         20
+#define GAMMA       "0F 00 7 2 0 0 6 5 4 1\n" \
+                    "04 16 2 7 6 3 2 1 7 7"
 
 
 /* Module Parameter: debug  (also available through sysfs) */
 MODULE_PARM_DEBUG;
-
-/* Module Parameter: rotate */
-static unsigned rotate = 0;
-module_param(rotate, uint, 0);
-MODULE_PARM_DESC(rotate, "Rotate display (0=normal, 1=clockwise, 2=upside down, 3=counterclockwise)");
 
 
 /* Power supply configuration */
@@ -107,7 +104,7 @@ static int itdb28fb_init_display(struct fbtft_par *par)
 	write_reg(par, 0x00EF, 0x1231); /* Set internal timing */
 	write_reg(par, 0x0001, 0x0100); /* set SS and SM bit */
 	write_reg(par, 0x0002, 0x0700); /* set 1 line inversion */
-	switch (rotate) {
+	switch (par->info->var.rotate) {
 	/* AM: GRAM update direction: horiz/vert. I/D: Inc/Dec address counter */
 	case 0:
 		write_reg(par, 0x03, 0x1030);
@@ -148,18 +145,6 @@ static int itdb28fb_init_display(struct fbtft_par *par)
 	write_reg(par, 0x0020, 0x0000); /* GRAM horizontal Address */
 	write_reg(par, 0x0021, 0x0000); /* GRAM Vertical Address */
 
-	/* ----------- Adjust the Gamma Curve ---------- */
-	write_reg(par, 0x0030, 0x0000);
-	write_reg(par, 0x0031, 0x0506);
-	write_reg(par, 0x0032, 0x0104);
-	write_reg(par, 0x0035, 0x0207);
-	write_reg(par, 0x0036, 0x000F);
-	write_reg(par, 0x0037, 0x0306);
-	write_reg(par, 0x0038, 0x0102);
-	write_reg(par, 0x0039, 0x0707);
-	write_reg(par, 0x003C, 0x0702);
-	write_reg(par, 0x003D, 0x1604);
-
 	/*------------------ Set GRAM area --------------- */
 	write_reg(par, 0x0050, 0x0000); /* Horizontal GRAM Start Address */
 	write_reg(par, 0x0051, 0x00EF); /* Horizontal GRAM End Address */
@@ -185,10 +170,45 @@ static int itdb28fb_init_display(struct fbtft_par *par)
 	return 0;
 }
 
+/*
+  Gamma string format:
+    VRP0 VRP1 RP0 RP1 KP0 KP1 KP2 KP3 KP4 KP5 KP6
+    VRN0 VRN1 RN0 RN1 KN0 KN1 KN2 KN3 KN4 KN5 KN6
+*/
+#define CURVE(num, idx)  curves[num*par->gamma.num_values + idx]
+static int set_gamma(struct fbtft_par *par, unsigned long *curves)
+{
+	unsigned long mask[] = { 0b11111, 0b11111, 0b111, 0b111, 0b111, 0b111, 0b111, 0b111, 0b111, 0b111, \
+	                         0b11111, 0b11111, 0b111, 0b111, 0b111, 0b111, 0b111, 0b111, 0b111, 0b111 };
+	int i,j;
+
+	fbtft_dev_dbg(DEBUG_INIT_DISPLAY, par->info->device, "%s()\n", __func__);
+
+	/* apply mask */
+	for (i=0;i<2;i++)
+		for (j=0;j<10;j++)
+			CURVE(i,j) &= mask[i*par->gamma.num_values + j];
+
+	write_reg(par, 0x0030, CURVE(0, 5) << 8 | CURVE(0, 4) );
+	write_reg(par, 0x0031, CURVE(0, 7) << 8 | CURVE(0, 6) );
+	write_reg(par, 0x0032, CURVE(0, 9) << 8 | CURVE(0, 8) );
+	write_reg(par, 0x0035, CURVE(0, 3) << 8 | CURVE(0, 2) );
+	write_reg(par, 0x0036, CURVE(0, 1) << 8 | CURVE(0, 0) );
+
+	write_reg(par, 0x0037, CURVE(1, 5) << 8 | CURVE(1, 4) );
+	write_reg(par, 0x0038, CURVE(1, 7) << 8 | CURVE(1, 6) );
+	write_reg(par, 0x0039, CURVE(1, 9) << 8 | CURVE(1, 8) );
+	write_reg(par, 0x003C, CURVE(1, 3) << 8 | CURVE(1, 2) );
+	write_reg(par, 0x003D, CURVE(1, 1) << 8 | CURVE(1, 0) );
+
+	return 0;
+}
+#undef CURVE
+
 static void itdb28fb_set_addr_win(struct fbtft_par *par, int xs, int ys, int xe, int ye)
 {
 	fbtft_dev_dbg(DEBUG_SET_ADDR_WIN, par->info->device, "%s(xs=%d, ys=%d, xe=%d, ye=%d)\n", __func__, xs, ys, xe, ye);
-	switch (rotate) {
+	switch (par->info->var.rotate) {
 	/* R20h = Horizontal GRAM Start Address */
 	/* R21h = Vertical GRAM Start Address */
 	case 0:
@@ -238,8 +258,13 @@ static int itdb28fb_verify_gpios(struct fbtft_par *par)
 }
 
 struct fbtft_display itdb28fb_display = {
+	.width = WIDTH,
+	.height = HEIGHT,
 	.bpp = BPP,
 	.fps = FPS,
+	.gamma_num = 2,
+	.gamma_len = 10,
+	.gamma = GAMMA,
 };
 
 static int itdb28fb_probe_common(struct spi_device *sdev, struct platform_device *pdev)
@@ -256,28 +281,10 @@ static int itdb28fb_probe_common(struct spi_device *sdev, struct platform_device
 
 	fbtft_dev_dbg(DEBUG_DRIVER_INIT_FUNCTIONS, dev, "%s()\n", __func__);
 
-	if (rotate > 3) {
-		dev_warn(dev, "module parameter 'rotate' illegal value: %d. Can only be 0,1,2,3. Setting it to 0.\n", rotate);
-		rotate = 0;
-	}
-	switch (rotate) {
-	case 0:
-	case 2:
-		itdb28fb_display.width = WIDTH;
-		itdb28fb_display.height = HEIGHT;
-		break;
-	case 1:
-	case 3:
-		itdb28fb_display.width = HEIGHT;
-		itdb28fb_display.height = WIDTH;
-		break;
-	}
-
 	info = fbtft_framebuffer_alloc(&itdb28fb_display, dev);
 	if (!info)
 		return -ENOMEM;
 
-	info->var.rotate = rotate;
 	par = info->par;
 	if (sdev)
 		par->spi = sdev;
@@ -286,6 +293,7 @@ static int itdb28fb_probe_common(struct spi_device *sdev, struct platform_device
 
 	fbtft_debug_init(par);
 	par->fbtftops.init_display = itdb28fb_init_display;
+	par->fbtftops.set_gamma = set_gamma;
 	par->fbtftops.register_backlight = fbtft_register_backlight;
 	par->fbtftops.write_reg = fbtft_write_reg16_bus8;
 	par->fbtftops.set_addr_win = itdb28fb_set_addr_win;

@@ -33,6 +33,7 @@
 
 #define FBTFT_GPIO_NO_MATCH		0xFFFF
 #define FBTFT_GPIO_NAME_SIZE	32
+#define FBTFT_GAMMA_MAX_VALUES_TOTAL 128
 
 struct fbtft_gpio {
 	char name[FBTFT_GPIO_NAME_SIZE];
@@ -41,8 +42,12 @@ struct fbtft_gpio {
 
 struct fbtft_platform_data {
 	const struct fbtft_gpio *gpios;
+	unsigned rotate;
+	bool bgr;          /* BlueGreenRed color format */
 	unsigned fps;
 	int txbuflen;
+	u8 startbyte;
+	char *gamma;       /* String representation of user provided Gamma curve(s) */
 	void *extra;
 };
 
@@ -50,6 +55,7 @@ struct fbtft_par;
 
 struct fbtft_ops {
 	int (*write)(struct fbtft_par *par, void *buf, size_t len);
+	int (*read)(struct fbtft_par *par, void *buf, size_t len);
 	int (*write_vmem)(struct fbtft_par *par);
 	void (*write_data_command)(struct fbtft_par *par, unsigned dc, u32 val);
 	void (*write_reg)(struct fbtft_par *par, int len, ...);
@@ -68,6 +74,8 @@ struct fbtft_ops {
 
 	void (*register_backlight)(struct fbtft_par *par);
 	void (*unregister_backlight)(struct fbtft_par *par);
+
+	int (*set_gamma)(struct fbtft_par *par, unsigned long *curves);
 };
 
 struct fbtft_display {
@@ -76,6 +84,9 @@ struct fbtft_display {
 	unsigned bpp;
 	unsigned fps;
 	int txbuflen;
+	char *gamma;       /* String representation of the default Gamma curve(s) */
+	int gamma_num;     /* Number of Gamma curves */
+	int gamma_len;     /* Number of values per Gamma curve */
 };
 
 struct fbtft_par {
@@ -91,23 +102,31 @@ struct fbtft_par {
 		size_t len;
 	} txbuf;
 	u8 *buf;  /* small buffer used when writing init data over SPI */
+	u8 startbyte; /* used by some controllers when in SPI mode. Format: 6 bit Device id + RS bit + RW bit */
 	struct fbtft_ops fbtftops;
 	unsigned dirty_lines_start;
 	unsigned dirty_lines_end;
 	struct {
 		int reset;
 		int dc;
-		/* the following is not used or requested by core */
 		int rd;
 		int wr;
+		int latch;
 		int cs;
 		int db[16];
 		int led[16];
 		int aux[16];
 	} gpio;
+	struct {
+		struct mutex lock;
+		unsigned long *curves;
+		int num_values;
+		int num_curves;
+	} gamma;
 	unsigned long *debug;
 	unsigned long current_debug;
 	bool first_update_done;
+	bool bgr;
 	void *extra;
 };
 
@@ -126,8 +145,10 @@ extern void fbtft_unregister_backlight(struct fbtft_par *par);
 
 /* fbtft-io.c */
 extern int fbtft_write_spi(struct fbtft_par *par, void *buf, size_t len);
+extern int fbtft_read_spi(struct fbtft_par *par, void *buf, size_t len);
 extern int fbtft_write_gpio8_wr(struct fbtft_par *par, void *buf, size_t len);
 extern int fbtft_write_gpio16_wr(struct fbtft_par *par, void *buf, size_t len);
+extern int fbtft_write_gpio16_wr_latched(struct fbtft_par *par, void *buf, size_t len);
 
 /* fbtft-bus.c */
 extern int fbtft_write_vmem8_bus8(struct fbtft_par *par);
@@ -136,6 +157,7 @@ extern int fbtft_write_vmem16_bus8(struct fbtft_par *par);
 extern int fbtft_write_vmem16_bus9(struct fbtft_par *par);
 extern void fbtft_write_reg8_bus8(struct fbtft_par *par, int len, ...);
 extern void fbtft_write_reg16_bus8(struct fbtft_par *par, int len, ...);
+extern void fbtft_write_reg16_bus16(struct fbtft_par *par, int len, ...);
 extern void fbtft_write_data_command8_bus8(struct fbtft_par *par, unsigned dc, u32 val);
 extern void fbtft_write_data_command8_bus9(struct fbtft_par *par, unsigned dc, u32 val);
 extern void fbtft_write_data_command16_bus16(struct fbtft_par *par, unsigned dc, u32 val);
@@ -147,7 +169,7 @@ extern void fbtft_write_data_command16_bus8(struct fbtft_par *par, unsigned dc, 
 /* shorthand debug levels */
 #define DEBUG_LEVEL_1               DEBUG_REQUEST_GPIOS
 #define DEBUG_LEVEL_2               (DEBUG_LEVEL_1 | DEBUG_DRIVER_INIT_FUNCTIONS | DEBUG_TIME_FIRST_UPDATE)
-#define DEBUG_LEVEL_3               (DEBUG_LEVEL_2 | DEBUG_RESET | DEBUG_INIT_DISPLAY | DEBUG_BLANK | DEBUG_FREE_GPIOS | DEBUG_VERIFY_GPIOS | DEBUG_BACKLIGHT)
+#define DEBUG_LEVEL_3               (DEBUG_LEVEL_2 | DEBUG_RESET | DEBUG_INIT_DISPLAY | DEBUG_BLANK | DEBUG_FREE_GPIOS | DEBUG_VERIFY_GPIOS | DEBUG_BACKLIGHT | DEBUG_SYSFS)
 #define DEBUG_LEVEL_4               (DEBUG_LEVEL_2 | DEBUG_FB_READ | DEBUG_FB_WRITE | DEBUG_FB_FILLRECT | DEBUG_FB_COPYAREA | DEBUG_FB_IMAGEBLIT | DEBUG_FB_BLANK)
 #define DEBUG_LEVEL_5               (DEBUG_LEVEL_3 | DEBUG_UPDATE_DISPLAY)
 #define DEBUG_LEVEL_6               (DEBUG_LEVEL_4 | DEBUG_LEVEL_5)
@@ -167,6 +189,8 @@ extern void fbtft_write_data_command16_bus8(struct fbtft_par *par, unsigned dc, 
 #define DEBUG_FB_IMAGEBLIT          (1<<12)
 #define DEBUG_FB_SETCOLREG          (1<<13)
 #define DEBUG_FB_BLANK              (1<<14)
+
+#define DEBUG_SYSFS                 (1<<16)
 
 /* fbtftops */
 #define DEBUG_BACKLIGHT             (1<<17)

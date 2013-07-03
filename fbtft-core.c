@@ -37,6 +37,9 @@
 
 #include "fbtft.h"
 
+extern void fbtft_sysfs_init(struct fbtft_par *par);
+extern void fbtft_sysfs_exit(struct fbtft_par *par);
+extern int fbtft_gamma_parse_str(struct fbtft_par *par, unsigned long *curves, const char *str, int size);
 
 // This will be used if the driver doesn't provide debug support
 #ifdef DEBUG
@@ -92,6 +95,10 @@ unsigned long fbtft_request_gpios_match(struct fbtft_par *par, const struct fbtf
 		par->gpio.rd = gpio->gpio;
 		return GPIOF_OUT_INIT_HIGH;
 	}
+	else if (strcasecmp(gpio->name, "latch") == 0) {
+		par->gpio.latch = gpio->gpio;
+		return GPIOF_OUT_INIT_LOW;
+	}
 	else if (gpio->name[0] == 'd' && gpio->name[1] == 'b') {
 		ret = kstrtol(&gpio->name[2], 10, &val);
 		if (ret == 0 && val < 16) {
@@ -121,6 +128,7 @@ int fbtft_request_gpios(struct fbtft_par *par)
 	par->gpio.rd = -1;
 	par->gpio.wr = -1;
 	par->gpio.cs = -1;
+	par->gpio.latch = -1;
 	for (i=0;i<16;i++) {
 		par->gpio.db[i] = -1;
 		par->gpio.led[i] = -1;
@@ -139,7 +147,7 @@ int fbtft_request_gpios(struct fbtft_par *par)
 			if (flags != FBTFT_GPIO_NO_MATCH) {
 				ret = gpio_request_one(gpio->gpio, flags, par->info->device->driver->name);
 				if (ret < 0) {
-					dev_err(par->info->device, "%s: no match for '%s' GPIO%d\n", __func__, gpio->name, gpio->gpio);
+					dev_err(par->info->device, "%s: gpio_request_one('%s'=%d) failed with %d\n", __func__, gpio->name, gpio->gpio, ret);
 					return ret;
 				}
 				fbtft_fbtft_dev_dbg(DEBUG_REQUEST_GPIOS, par, par->info->device, "%s: '%s' = GPIO%d\n", __func__, gpio->name, gpio->gpio);
@@ -166,7 +174,7 @@ void fbtft_free_gpios(struct fbtft_par *par)
 	if (pdata && pdata->gpios) {
 		gpio = pdata->gpios;
 		while (gpio->name[0]) {
-			dev_dbg(par->info->device, "fbtft_free_gpios: freeing '%s'\n", gpio->name);
+			fbtft_fbtft_dev_dbg(DEBUG_FREE_GPIOS, par, par->info->device, "%s(): gpio_free('%s'=%d)\n", __func__, gpio->name, gpio->gpio);
 			gpio_direction_input(gpio->gpio);  /* if the gpio wasn't recognized by request_gpios, WARN() will protest */
 			gpio_free(gpio->gpio);
 			gpio++;
@@ -258,29 +266,22 @@ void fbtft_set_addr_win(struct fbtft_par *par, int xs, int ys, int xe, int ye)
 {
 	fbtft_fbtft_dev_dbg(DEBUG_SET_ADDR_WIN, par, par->info->device, "%s(xs=%d, ys=%d, xe=%d, ye=%d)\n", __func__, xs, ys, xe, ye);
 
-        uint8_t xsl = (uint8_t)(xs & 0xff);
-        uint8_t xsh = (uint8_t)((xs >> 8) & 0xff);
-        uint8_t xel = (uint8_t)(xe & 0xff);
-        uint8_t xeh = (uint8_t)((xe >> 8) & 0xff);
+	/* Column address set */
+	write_cmd(par, 0x2A);
+	write_data(par, (xs >> 8) & 0xFF);
+	write_data(par, xs & 0xFF);
+	write_data(par, (xe >> 8) & 0xFF);
+	write_data(par, xe & 0xFF);
 
-        uint8_t ysl = (uint8_t)(ys & 0xff);
-        uint8_t ysh = (uint8_t)((ys >> 8) & 0xff);
-        uint8_t yel = (uint8_t)(ye & 0xff);
-        uint8_t yeh = (uint8_t)((ye >> 8) & 0xff);
+	/* Row adress set */
+	write_cmd(par, 0x2B);
+	write_data(par, (ys >> 8) & 0xFF);
+	write_data(par, ys & 0xFF);
+	write_data(par, (ye >> 8) & 0xFF);
+	write_data(par, ye & 0xFF);
 
-        write_cmd(par, FBTFT_CASET);
-        write_data(par, xsh);
-        write_data(par, xsl);
-        write_data(par, xeh);
-        write_data(par, xel);
-
-        write_cmd(par, FBTFT_RASET);
-        write_data(par, ysh);
-        write_data(par, ysl);
-        write_data(par, yeh);
-        write_data(par, yel);
-
-        write_cmd(par, FBTFT_RAMWR);
+	/* Memory write */
+	write_cmd(par, 0x2C);
 }
 
 
@@ -494,7 +495,7 @@ int fbtft_fb_blank(int blank, struct fb_info *info)
 	fbtft_fbtft_dev_dbg(DEBUG_FB_BLANK, par, info->dev, "%s(blank=%d)\n", __func__, blank);
 
 	if (!par->fbtftops.blank)
-		return 0;
+		return ret;
 
 	switch (blank) {
 	case FB_BLANK_POWERDOWN:
@@ -538,10 +539,23 @@ struct fb_info *fbtft_framebuffer_alloc(struct fbtft_display *display, struct de
 	u8 *vmem = NULL;
 	void *txbuf = NULL;
 	void *buf = NULL;
+	unsigned width;
+	unsigned height;
 	int txbuflen = display->txbuflen;
 	unsigned bpp = display->bpp;
 	unsigned fps = display->fps;
+	unsigned rotate = 0;
+	bool bgr = false;
+	u8 startbyte = 0;
 	int vmem_size;
+	char *gamma = display->gamma;
+	unsigned long *gamma_curves = NULL;
+
+	/* sanity check */
+	if (display->gamma_num * display->gamma_len > FBTFT_GAMMA_MAX_VALUES_TOTAL) {
+		dev_err(dev, "%s: FBTFT_GAMMA_MAX_VALUES_TOTAL=%d is exceeded\n", __func__, FBTFT_GAMMA_MAX_VALUES_TOTAL);
+		return NULL;
+	}
 
 	/* defaults */
 	if (!fps)
@@ -557,6 +571,22 @@ struct fb_info *fbtft_framebuffer_alloc(struct fbtft_display *display, struct de
 			fps = pdata->fps;
 		if (pdata->txbuflen)
 			txbuflen = pdata->txbuflen;
+		rotate = pdata->rotate & 3;
+		bgr = pdata->bgr;
+		startbyte = pdata->startbyte;
+		if (pdata->gamma)
+			gamma = pdata->gamma;
+	}
+
+	switch (rotate) {
+	case 1:
+	case 3:
+		width =  display->height;
+		height = display->width;
+		break;
+	default:
+		width =  display->width;
+		height = display->height;
 	}
 
 	vmem = vzalloc(vmem_size);
@@ -574,6 +604,12 @@ struct fb_info *fbtft_framebuffer_alloc(struct fbtft_display *display, struct de
 	buf = vzalloc(128);
 	if (!buf)
 		goto alloc_fail;
+
+	if (display->gamma_num && display->gamma_len) {
+		gamma_curves = kzalloc(display->gamma_num * display->gamma_len * sizeof(gamma_curves[0]), GFP_KERNEL);
+		if (!gamma_curves)
+			goto alloc_fail;
+	}
 
 	info = framebuffer_alloc(sizeof(struct fbtft_par), dev);
 	if (!info)
@@ -602,14 +638,15 @@ struct fb_info *fbtft_framebuffer_alloc(struct fbtft_display *display, struct de
 	info->fix.xpanstep =	   0;
 	info->fix.ypanstep =	   0;
 	info->fix.ywrapstep =	   0;
-	info->fix.line_length =    display->width*bpp/8;
+	info->fix.line_length =    width*bpp/8;
 	info->fix.accel =          FB_ACCEL_NONE;
 	info->fix.smem_len =       vmem_size;
 
-	info->var.xres =           display->width;
-	info->var.yres =           display->height;
-	info->var.xres_virtual =   display->width;
-	info->var.yres_virtual =   display->height;
+	info->var.rotate =         rotate;
+	info->var.xres =           width;
+	info->var.yres =           height;
+	info->var.xres_virtual =   info->var.xres;
+	info->var.yres_virtual =   info->var.yres;
 	info->var.bits_per_pixel = bpp;
 	info->var.nonstd =         1;
 
@@ -633,8 +670,16 @@ struct fb_info *fbtft_framebuffer_alloc(struct fbtft_display *display, struct de
 	// Set display line markers as dirty for all. Ensures first update to update all of the display.
 	par->dirty_lines_start = 0;
 	par->dirty_lines_end = par->info->var.yres - 1;
+	par->bgr = bgr;
+	par->startbyte = startbyte;
+	par->gamma.curves = gamma_curves;
+	par->gamma.num_curves = display->gamma_num;
+	par->gamma.num_values = display->gamma_len;
+	mutex_init(&par->gamma.lock);
+	info->pseudo_palette = par->pseudo_palette;
 
-    info->pseudo_palette = par->pseudo_palette;
+	if (par->gamma.curves && gamma)
+		fbtft_gamma_parse_str(par, par->gamma.curves, gamma, strlen(gamma));
 
 	// Transmit buffer
 	if (txbuflen == -1)
@@ -645,16 +690,17 @@ struct fb_info *fbtft_framebuffer_alloc(struct fbtft_display *display, struct de
 		txbuflen = PAGE_SIZE; /* need buffer for byteswapping */
 #endif
 
-	if (txbuflen) {
+	if (txbuflen > 0) {
 		txbuf = vzalloc(txbuflen);
 		if (!txbuf)
 			goto alloc_fail;
 		par->txbuf.buf = txbuf;
+		par->txbuf.len = txbuflen;
 	}
-	par->txbuf.len = txbuflen;
 
 	// default fbtft operations
 	par->fbtftops.write = fbtft_write_spi;
+	par->fbtftops.read = fbtft_read_spi;
 	par->fbtftops.write_vmem = fbtft_write_vmem16_bus8;
 	par->fbtftops.write_data_command = fbtft_write_data_command8_bus8;
 	par->fbtftops.write_reg = fbtft_write_reg8_bus8;
@@ -678,6 +724,8 @@ alloc_fail:
 		kfree(fbops);
 	if (fbdefio)
 		kfree(fbdefio);
+	if (gamma_curves)
+		kfree(gamma_curves);
 
 	return NULL;
 }
@@ -700,6 +748,9 @@ void fbtft_framebuffer_release(struct fb_info *info)
 	vfree(par->buf);
 	kfree(info->fbops);
 	kfree(info->fbdefio);
+	if (par->gamma.curves) {
+		kfree(par->gamma.curves);
+	}
 	framebuffer_release(info);
 }
 EXPORT_SYMBOL(fbtft_framebuffer_release);
@@ -754,6 +805,12 @@ int fbtft_register_framebuffer(struct fb_info *fb_info)
 
 	par->fbtftops.update_display(par);
 
+	if (par->fbtftops.set_gamma && par->gamma.curves) {
+		ret = par->fbtftops.set_gamma(par, par->gamma.curves);
+		if (ret)
+			goto reg_fail;
+	}
+
 	if (par->fbtftops.register_backlight)
 		par->fbtftops.register_backlight(par);
 
@@ -761,13 +818,14 @@ int fbtft_register_framebuffer(struct fb_info *fb_info)
 	if (ret < 0)
 		goto reg_fail;
 
-	// [Tue Jan  8 19:36:41 2013] graphics fb1: hx8340fb frame buffer, 75 KiB video memory, 151 KiB buffer memory, spi0.0 at 32 MHz
+	fbtft_sysfs_init(par);
+
 	if (par->txbuf.buf)
 		sprintf(text1, ", %d KiB buffer memory", par->txbuf.len >> 10);
 	if (spi)
 		sprintf(text2, ", spi%d.%d at %d MHz", spi->master->bus_num, spi->chip_select, spi->max_speed_hz/1000000);
-	dev_info(fb_info->dev, "%s frame buffer, %d KiB video memory%s, fps=%lu%s\n",
-		fb_info->fix.id, fb_info->fix.smem_len >> 10, text1, HZ/fb_info->fbdefio->delay, text2);
+	dev_info(fb_info->dev, "%s frame buffer, %dx%d, %d KiB video memory%s, fps=%lu%s\n",
+		fb_info->fix.id, fb_info->var.xres, fb_info->var.yres, fb_info->fix.smem_len >> 10, text1, HZ/fb_info->fbdefio->delay, text2);
 
 	/* Turn on backlight if available */
 	if (fb_info->bl_dev) {
@@ -809,6 +867,7 @@ int fbtft_unregister_framebuffer(struct fb_info *fb_info)
 		spi_set_drvdata(spi, NULL);
 	if (par->pdev)
 		platform_set_drvdata(par->pdev, NULL);
+	fbtft_sysfs_exit(par);
 	par->fbtftops.free_gpios(par);
 	ret = unregister_framebuffer(fb_info);
 	if (par->fbtftops.unregister_backlight)
@@ -816,21 +875,6 @@ int fbtft_unregister_framebuffer(struct fb_info *fb_info)
 	return ret;
 }
 EXPORT_SYMBOL(fbtft_unregister_framebuffer);
-
-/* fbtft-io.c */
-EXPORT_SYMBOL(fbtft_write_spi);
-EXPORT_SYMBOL(fbtft_write_gpio8_wr);
-EXPORT_SYMBOL(fbtft_write_gpio16_wr);
-
-/* fbtft-bus.c */
-EXPORT_SYMBOL(fbtft_write_vmem8_bus8);
-EXPORT_SYMBOL(fbtft_write_vmem16_bus16);
-EXPORT_SYMBOL(fbtft_write_vmem16_bus8);
-EXPORT_SYMBOL(fbtft_write_vmem16_bus9);
-EXPORT_SYMBOL(fbtft_write_data_command8_bus8);
-EXPORT_SYMBOL(fbtft_write_data_command8_bus9);
-EXPORT_SYMBOL(fbtft_write_data_command16_bus16);
-EXPORT_SYMBOL(fbtft_write_data_command16_bus8);
 
 
 MODULE_LICENSE("GPL");
